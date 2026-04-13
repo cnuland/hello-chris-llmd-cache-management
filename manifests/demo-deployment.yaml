@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-d-demo
+  namespace: llm-d-demo
+  labels:
+    app: llm-d-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-d-demo
+  template:
+    metadata:
+      labels:
+        app: llm-d-demo
+    spec:
+      containers:
+        - name: nginx
+          image: docker.io/nginxinc/nginx-unprivileged:alpine
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+              readOnly: true
+          resources:
+            limits:
+              memory: 128Mi
+              cpu: 100m
+            requests:
+              memory: 64Mi
+              cpu: 50m
+      volumes:
+        - name: html
+          configMap:
+            name: llm-d-demo-html
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-d-demo
+  namespace: llm-d-demo
+  labels:
+    app: llm-d-demo
+spec:
+  selector:
+    app: llm-d-demo
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: llm-d-demo
+  namespace: llm-d-demo
+  labels:
+    app: llm-d-demo
+spec:
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  to:
+    kind: Service
+    name: llm-d-demo
+    weight: 100
+  port:
+    targetPort: 8080

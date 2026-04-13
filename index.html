@@ -1,0 +1,2082 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>llm-d Cache Manager — Tiered KV Cache Offloading</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0a0a1a;
+    --bg-card: #12122a;
+    --bg-card-highlight: #1a1a3a;
+    --border: #2a2a5a;
+    --border-glow: #4a4aff;
+    --text: #e0e0f0;
+    --text-dim: #8080a0;
+    --cyan: #00d4ff;
+    --green: #00ff88;
+    --blue: #4488ff;
+    --magenta: #cc44ff;
+    --yellow: #ffcc00;
+    --red: #ff4466;
+    --orange: #ff8844;
+    --gpu-color: #00ff88;
+    --cpu-color: #4488ff;
+    --storage-color: #cc44ff;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', 'SF Pro Display', -apple-system, system-ui, sans-serif;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+  }
+
+  /* ── SCENE CONTAINER ── */
+  #app {
+    width: 100vw;
+    height: 100vh;
+    position: relative;
+  }
+
+  /* ── TOP BAR ── */
+  #topbar {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 56px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 32px;
+    background: rgba(10,10,26,0.9);
+    border-bottom: 1px solid var(--border);
+    z-index: 100;
+  }
+  #topbar .logo {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--cyan);
+    letter-spacing: 1px;
+  }
+  #topbar .logo span { color: var(--text-dim); font-weight: 400; }
+  #topbar .scene-label {
+    font-size: 14px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+  #topbar .controls {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  #topbar .controls button {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.2s;
+  }
+  #topbar .controls button:hover {
+    border-color: var(--cyan);
+    color: var(--cyan);
+  }
+  #topbar .controls button.active {
+    background: var(--cyan);
+    color: var(--bg);
+    border-color: var(--cyan);
+  }
+
+  /* ── PROGRESS BAR ── */
+  #progress-bar {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 4px;
+    background: var(--border);
+    z-index: 100;
+  }
+  #progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--cyan), var(--blue));
+    width: 0%;
+    transition: width 0.3s ease;
+  }
+
+  /* ── SCENE DOTS ── */
+  #scene-dots {
+    position: absolute;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 10px;
+    z-index: 100;
+  }
+  .scene-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--border);
+    cursor: pointer;
+    transition: all 0.3s;
+  }
+  .scene-dot.active {
+    background: var(--cyan);
+    box-shadow: 0 0 10px var(--cyan);
+  }
+  .scene-dot.done {
+    background: var(--blue);
+  }
+
+  /* ── FOOTER ── */
+  #site-footer {
+    position: absolute;
+    bottom: 6px;
+    right: 32px;
+    font-size: 11px;
+    color: var(--text-dim);
+    z-index: 101;
+    letter-spacing: 0.5px;
+  }
+
+  /* ── CANVAS OVERLAY ── */
+  #particle-canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 50;
+  }
+
+  /* ── SCENE VIEWS ── */
+  .scene {
+    position: absolute;
+    top: 56px; left: 0; right: 0; bottom: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transform: translateY(30px);
+    transition: opacity 0.6s ease, transform 0.6s ease;
+    pointer-events: none;
+  }
+  .scene.active {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+
+  /* ── INTRO SCENE ── */
+  #scene-intro {
+    flex-direction: column;
+    gap: 24px;
+    text-align: center;
+  }
+  #scene-intro h1 {
+    font-size: 56px;
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--cyan), var(--blue));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  #scene-intro h2 {
+    font-size: 28px;
+    font-weight: 400;
+    color: var(--text-dim);
+    max-width: 700px;
+  }
+  #scene-intro .start-hint {
+    font-size: 16px;
+    color: var(--text-dim);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
+  }
+
+  /* ── ARCH / ANIM SCENES ── */
+  .scene-content {
+    width: 100%;
+    height: 100%;
+    padding: 24px 40px;
+    display: flex;
+    flex-direction: column;
+  }
+  .scene-title {
+    font-size: 28px;
+    font-weight: 700;
+    margin-bottom: 6px;
+    color: var(--cyan);
+  }
+  .scene-subtitle {
+    font-size: 15px;
+    color: var(--text-dim);
+    margin-bottom: 20px;
+  }
+
+  /* ── ARCHITECTURE LAYOUT ── */
+  .arch-container {
+    flex: 1;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+  }
+
+  .arch-row {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 40px;
+    position: relative;
+  }
+
+  .arch-node {
+    background: var(--bg-card);
+    border: 1.5px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 22px;
+    text-align: center;
+    position: relative;
+    transition: all 0.4s ease;
+    min-width: 150px;
+  }
+  .arch-node.highlight {
+    border-color: var(--cyan);
+    box-shadow: 0 0 20px rgba(0,212,255,0.2);
+  }
+  .arch-node.glow-green {
+    border-color: var(--green);
+    box-shadow: 0 0 20px rgba(0,255,136,0.3);
+  }
+  .arch-node.glow-red {
+    border-color: var(--red);
+    box-shadow: 0 0 20px rgba(255,68,102,0.3);
+  }
+  .arch-node .node-label {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .arch-node .node-detail {
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  /* ── POD WITH TIERS ── */
+  .pod-node {
+    background: var(--bg-card);
+    border: 1.5px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    min-width: 200px;
+    transition: all 0.4s ease;
+  }
+  .pod-node.selected {
+    border-color: var(--green);
+    box-shadow: 0 0 24px rgba(0,255,136,0.25);
+  }
+  .pod-node .pod-header {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .pod-node .pod-score {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--yellow);
+    opacity: 0;
+    transition: opacity 0.4s;
+  }
+  .pod-node .pod-score.visible { opacity: 1; }
+
+  .tier-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .tier-label {
+    font-size: 11px;
+    font-weight: 600;
+    width: 36px;
+    flex-shrink: 0;
+  }
+  .tier-label.gpu { color: var(--gpu-color); }
+  .tier-label.cpu { color: var(--cpu-color); }
+  .tier-label.fs { color: var(--storage-color); }
+
+  .tier-track {
+    flex: 1;
+    height: 16px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+  }
+  .tier-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.8s ease;
+    position: relative;
+  }
+  .tier-fill.gpu { background: linear-gradient(90deg, #00cc66, var(--gpu-color)); }
+  .tier-fill.cpu { background: linear-gradient(90deg, #2266cc, var(--cpu-color)); }
+  .tier-fill.fs  { background: linear-gradient(90deg, #8822cc, var(--storage-color)); }
+
+  .tier-pct {
+    font-size: 10px;
+    color: var(--text-dim);
+    width: 32px;
+    text-align: right;
+    flex-shrink: 0;
+  }
+
+  /* ── CONNECTOR LINES (SVG) ── */
+  .connector-svg {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 1;
+  }
+  .connector-svg line, .connector-svg path {
+    stroke: var(--border);
+    stroke-width: 1.5;
+    fill: none;
+  }
+  .connector-svg .active-line {
+    stroke: var(--cyan);
+    stroke-width: 2;
+    filter: drop-shadow(0 0 4px var(--cyan));
+  }
+
+  /* ── FLOATING BLOCKS (animated KV blocks) ── */
+  .kv-block {
+    position: absolute;
+    width: 18px; height: 18px;
+    border-radius: 4px;
+    z-index: 60;
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  .kv-block.gpu-block { background: var(--gpu-color); box-shadow: 0 0 8px var(--gpu-color); }
+  .kv-block.cpu-block { background: var(--cpu-color); box-shadow: 0 0 8px var(--cpu-color); }
+  .kv-block.fs-block  { background: var(--storage-color); box-shadow: 0 0 8px var(--storage-color); }
+  .kv-block.event-block { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); width: 10px; height: 10px; border-radius: 50%; }
+
+  /* ── SHARED STORAGE ── */
+  .shared-storage {
+    background: var(--bg-card);
+    border: 1.5px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 32px;
+    text-align: center;
+    min-width: 500px;
+    transition: all 0.4s;
+  }
+  .shared-storage.highlight {
+    border-color: var(--storage-color);
+    box-shadow: 0 0 20px rgba(204,68,255,0.2);
+  }
+  .shared-storage .storage-label {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--storage-color);
+    margin-bottom: 8px;
+  }
+  .shared-storage .storage-detail {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .storage-blocks {
+    display: flex;
+    gap: 4px;
+    justify-content: center;
+    margin-top: 8px;
+    flex-wrap: wrap;
+    max-width: 400px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+  .storage-block-mini {
+    width: 12px; height: 12px;
+    background: var(--storage-color);
+    border-radius: 2px;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .storage-block-mini.visible { opacity: 0.6; }
+
+  /* ── STATS PANEL ── */
+  .stats-row {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    margin-top: 16px;
+  }
+  .stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 20px;
+    text-align: center;
+    min-width: 140px;
+    transition: all 0.4s;
+  }
+  .stat-card.highlight {
+    border-color: var(--green);
+    box-shadow: 0 0 12px rgba(0,255,136,0.15);
+  }
+  .stat-value {
+    font-size: 24px;
+    font-weight: 700;
+  }
+  .stat-value.green { color: var(--green); }
+  .stat-value.cyan { color: var(--cyan); }
+  .stat-value.yellow { color: var(--yellow); }
+  .stat-value.red { color: var(--red); }
+  .stat-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+
+  /* ── BENCHMARK BARS ── */
+  .bench-group {
+    margin-bottom: 20px;
+  }
+  .bench-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  .bench-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
+  .bench-label {
+    font-size: 12px;
+    width: 120px;
+    text-align: right;
+    color: var(--text-dim);
+    flex-shrink: 0;
+  }
+  .bench-track {
+    flex: 1;
+    height: 28px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+    max-width: 500px;
+  }
+  .bench-fill {
+    height: 100%;
+    border-radius: 6px;
+    transition: width 1.2s cubic-bezier(0.22, 1, 0.36, 1);
+    display: flex;
+    align-items: center;
+    padding-left: 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--bg);
+    width: 0%;
+  }
+  .bench-fill.baseline { background: linear-gradient(90deg, #996600, var(--yellow)); }
+  .bench-fill.improved { background: linear-gradient(90deg, #006644, var(--green)); }
+  .bench-change {
+    font-size: 13px;
+    font-weight: 700;
+    width: 80px;
+    flex-shrink: 0;
+  }
+  .bench-change.good { color: var(--green); }
+
+  /* ── CALLOUT BOX ── */
+  .callout {
+    background: rgba(0,212,255,0.08);
+    border: 1px solid rgba(0,212,255,0.25);
+    border-radius: 10px;
+    padding: 16px 24px;
+    margin-top: 16px;
+    font-size: 14px;
+    line-height: 1.6;
+    max-width: 800px;
+    opacity: 0;
+    transform: translateY(10px);
+    transition: all 0.5s ease;
+  }
+  .callout.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  .callout strong { color: var(--cyan); }
+
+  /* ── REQUEST ANIMATION ── */
+  .request-packet {
+    position: absolute;
+    background: var(--cyan);
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    box-shadow: 0 0 12px var(--cyan);
+    z-index: 60;
+    opacity: 0;
+  }
+
+  /* ── HASH VIS ── */
+  .hash-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    width: 100%;
+  }
+  .prompt-display {
+    font-size: 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 24px;
+    max-width: 800px;
+    line-height: 1.8;
+    text-align: center;
+  }
+  .prompt-display .token {
+    display: inline-block;
+    padding: 2px 6px;
+    margin: 2px;
+    border-radius: 4px;
+    transition: all 0.3s;
+    font-size: 14px;
+  }
+  .prompt-display .token.highlighted {
+    background: rgba(0,212,255,0.15);
+    border: 1px solid var(--cyan);
+  }
+  .block-chain {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .hash-block {
+    background: var(--bg-card);
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    text-align: center;
+    opacity: 0;
+    transform: scale(0.8);
+    transition: all 0.4s ease;
+    min-width: 120px;
+  }
+  .hash-block.visible {
+    opacity: 1;
+    transform: scale(1);
+  }
+  .hash-block .block-idx {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+  .hash-block .block-hash {
+    font-size: 12px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    color: var(--yellow);
+  }
+  .hash-block .block-tokens {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+  .chain-arrow {
+    color: var(--cyan);
+    font-size: 20px;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .chain-arrow.visible { opacity: 1; }
+
+  /* ── SUMMARY ── */
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+    max-width: 900px;
+    width: 100%;
+  }
+  .summary-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    text-align: center;
+    opacity: 0;
+    transform: translateY(20px);
+    transition: all 0.5s ease;
+  }
+  .summary-card.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  .summary-card .summary-icon {
+    font-size: 36px;
+    margin-bottom: 12px;
+  }
+  .summary-card .summary-stat {
+    font-size: 32px;
+    font-weight: 800;
+    margin-bottom: 4px;
+  }
+  .summary-card .summary-desc {
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.4;
+  }
+
+  /* ── EVENT STREAM ── */
+  .event-stream {
+    position: absolute;
+    right: 40px;
+    top: 80px;
+    transform: none;
+    width: 280px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    max-height: 320px;
+    overflow: hidden;
+  }
+  .event-stream-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--cyan);
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .event-item {
+    font-size: 11px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    padding: 3px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    opacity: 0;
+    transform: translateX(20px);
+    transition: all 0.3s ease;
+    display: flex;
+    gap: 6px;
+  }
+  .event-item.visible {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  .event-type { color: var(--green); }
+  .event-pod { color: var(--cyan); }
+  .event-tier-gpu { color: var(--gpu-color); }
+  .event-tier-cpu { color: var(--cpu-color); }
+
+  /* ── DESCRIPTION PANEL ── */
+  .desc-panel {
+    position: absolute;
+    bottom: 40px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(18,18,42,0.95);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 28px;
+    font-size: 14px;
+    color: var(--text-dim);
+    text-align: center;
+    max-width: 700px;
+    z-index: 80;
+    opacity: 0;
+    transition: opacity 0.5s;
+  }
+  .desc-panel.visible { opacity: 1; }
+  .desc-panel strong { color: var(--text); }
+
+  /* ── ANIMATIONS ── */
+  @keyframes float-up {
+    from { transform: translateY(0); opacity: 1; }
+    to   { transform: translateY(-40px); opacity: 0; }
+  }
+  @keyframes slide-in-right {
+    from { transform: translateX(40px); opacity: 0; }
+    to   { transform: translateX(0); opacity: 1; }
+  }
+  @keyframes glow-pulse {
+    0%, 100% { box-shadow: 0 0 8px rgba(0,212,255,0.2); }
+    50% { box-shadow: 0 0 24px rgba(0,212,255,0.5); }
+  }
+
+  /* ── EXPLAINER SIDE PANEL ── */
+  .explainer {
+    position: absolute;
+    right: 24px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 300px;
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
+    background: rgba(18, 18, 42, 0.92);
+    border: 1px solid rgba(0,212,255,0.2);
+    border-radius: 14px;
+    padding: 24px;
+    z-index: 70;
+    opacity: 0;
+    transform: translateY(-50%) translateX(20px);
+    transition: opacity 0.6s ease 0.4s, transform 0.6s ease 0.4s;
+  }
+  .scene.active .explainer {
+    opacity: 1;
+    transform: translateY(-50%) translateX(0);
+  }
+  .explainer-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--cyan);
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(0,212,255,0.15);
+  }
+  .explainer h3 {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 10px;
+    line-height: 1.3;
+  }
+  .explainer p {
+    font-size: 13px;
+    line-height: 1.65;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+  }
+  .explainer p:last-child { margin-bottom: 0; }
+  .explainer strong { color: var(--text); font-weight: 600; }
+  .explainer em { color: var(--cyan); font-style: normal; font-weight: 600; }
+  .explainer .analogy {
+    background: rgba(0,212,255,0.06);
+    border-left: 3px solid var(--cyan);
+    padding: 10px 14px;
+    border-radius: 0 8px 8px 0;
+    margin: 12px 0;
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--text);
+  }
+  .explainer .takeaway {
+    background: rgba(0,255,136,0.06);
+    border: 1px solid rgba(0,255,136,0.15);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-top: 14px;
+    font-size: 12px;
+    color: var(--green);
+    line-height: 1.5;
+  }
+  .explainer .takeaway strong { color: var(--green); }
+
+  /* Shift scene main content left when explainer present */
+  .scene-content.with-explainer {
+    padding-right: 350px;
+  }
+  .scene-content.with-explainer .arch-container {
+    align-items: center;
+  }
+
+  /* keyboard hint */
+  .key-hint {
+    position: absolute;
+    bottom: 40px;
+    right: 40px;
+    font-size: 12px;
+    color: var(--text-dim);
+    z-index: 100;
+  }
+  .key-hint kbd {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-family: inherit;
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- Top Bar -->
+  <div id="topbar">
+    <div class="logo">llm-d <span>Cache Manager</span></div>
+    <div class="scene-label" id="scene-label">Introduction</div>
+    <div class="controls">
+      <button id="btn-prev" onclick="prevScene()">← Prev</button>
+      <button id="btn-auto" onclick="toggleAuto()">Auto Play</button>
+      <button id="btn-next" onclick="nextScene()">Next →</button>
+    </div>
+  </div>
+
+  <!-- Progress -->
+  <div id="progress-bar"><div id="progress-fill"></div></div>
+
+  <!-- Scene Dots -->
+  <div id="scene-dots"></div>
+
+  <!-- Particle Canvas -->
+  <canvas id="particle-canvas"></canvas>
+
+  <!-- Key hints -->
+  <div class="key-hint"><kbd>←</kbd> <kbd>→</kbd> navigate &nbsp; <kbd>Space</kbd> auto-play</div>
+
+  <!-- Footer -->
+  <div id="site-footer">Christopher Nuland · Red Hat</div>
+
+  <!-- ═══════════ SCENE 0: INTRO ═══════════ -->
+  <div class="scene active" id="scene-intro">
+    <div class="explainer" style="top: 50%; width: 320px;">
+      <div class="explainer-label">About this demo</div>
+      <h3>A deep dive into llm-d's Cache Manager and Tiered KV Cache Offloading</h3>
+      <p>This demo focuses on <strong>two specific features</strong> of the llm-d project: the <em>KV-Cache Indexer</em> for cache-aware routing, and <em>tiered KV cache offloading</em> across GPU, CPU, and persistent storage.</p>
+      <p>When you run large AI models across multiple servers, a lot of <strong>repeated computation</strong> happens behind the scenes. These features eliminate that waste by caching intermediate results and routing requests to the server most likely to already have relevant cached data.</p>
+      <p>No AI/ML expertise required to follow along.</p>
+    </div>
+    <h1>llm-d</h1>
+    <h2>Cache Manager &amp; Tiered<br>KV Cache Offloading</h2>
+    <p style="color: var(--text-dim); font-size: 16px; margin-top: 8px;">
+      Distributed KV cache management for LLM inference at scale
+    </p>
+    <p style="color: var(--text); font-size: 15px; margin-top: 24px;">Christopher Nuland</p>
+    <p style="color: var(--text-dim); font-size: 13px; margin-top: 4px;">Technical Marketing Manager, AI Inference — Red Hat</p>
+    <p class="start-hint" style="margin-top: 24px;">Press → or Space to begin</p>
+  </div>
+
+  <!-- ═══════════ SCENE 1: THE PROBLEM ═══════════ -->
+  <div class="scene" id="scene-problem">
+    <div class="explainer">
+      <div class="explainer-label">In plain terms</div>
+      <h3>Why does this matter?</h3>
+      <p>When you send a message to an AI, the model has to <strong>read and process your entire prompt</strong> before it can start responding. This step is called <em>prefill</em>.</p>
+      <p>Most enterprise apps use a <strong>system prompt</strong> — a long set of instructions that's the same for every user. Think: "You are a helpful customer service agent for Acme Corp..."</p>
+      <div class="analogy">Imagine your F1 team has two cars entering qualifying. Each needs the same aerodynamic setup dialed in. Without a strategist coordinating, each engineer starts from zero — measuring, adjusting, testing — <strong>doing identical work twice</strong>. With a shared setup sheet, one engineer dials it in and the other just copies it.</div>
+      <p>Without cache management, the load balancer has <strong>no idea</strong> which server already processed that system prompt — so it sends each request to a random pod, and every pod re-does the same expensive work.</p>
+      <div class="takeaway"><strong>Bottom line:</strong> You're paying 3x the GPU compute for no reason. At scale, this is the difference between 10 GPUs and 30.</div>
+    </div>
+    <div class="scene-content with-explainer">
+      <div class="scene-title">The Problem</div>
+      <div class="scene-subtitle">Without cache management, every request pays the full prefill cost</div>
+      <div class="arch-container" id="problem-arch">
+        <div class="arch-row" style="margin-bottom: 30px;">
+          <div class="arch-node" id="prob-client">
+            <div class="node-label">Clients</div>
+            <div class="node-detail">3 requests, same system prompt</div>
+          </div>
+        </div>
+        <div class="arch-row" style="margin-bottom: 30px;">
+          <div class="arch-node" id="prob-lb">
+            <div class="node-label">Load Balancer</div>
+            <div class="node-detail">Round-robin (cache-blind)</div>
+          </div>
+        </div>
+        <div class="arch-row" style="gap: 24px;">
+          <div class="pod-node" id="prob-pod0">
+            <div class="pod-header">vLLM Pod 0</div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" id="prob-gpu0" style="width:0%"></div></div>
+              <span class="tier-pct" id="prob-gpu0-pct">0%</span>
+            </div>
+            <div style="font-size:12px; color: var(--red); opacity:0; margin-top:6px; text-align:center;" id="prob-prefill0">COMPUTING PREFILL...</div>
+          </div>
+          <div class="pod-node" id="prob-pod1">
+            <div class="pod-header">vLLM Pod 1</div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" id="prob-gpu1" style="width:0%"></div></div>
+              <span class="tier-pct" id="prob-gpu1-pct">0%</span>
+            </div>
+            <div style="font-size:12px; color: var(--red); opacity:0; margin-top:6px; text-align:center;" id="prob-prefill1">COMPUTING PREFILL...</div>
+          </div>
+          <div class="pod-node" id="prob-pod2">
+            <div class="pod-header">vLLM Pod 2</div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" id="prob-gpu2" style="width:0%"></div></div>
+              <span class="tier-pct" id="prob-gpu2-pct">0%</span>
+            </div>
+            <div style="font-size:12px; color: var(--red); opacity:0; margin-top:6px; text-align:center;" id="prob-prefill2">COMPUTING PREFILL...</div>
+          </div>
+        </div>
+        <div class="stats-row" style="margin-top: 24px;">
+          <div class="stat-card">
+            <div class="stat-value red" id="prob-redundant">0x</div>
+            <div class="stat-label">Redundant Prefill</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value yellow" id="prob-wasted">0ms</div>
+            <div class="stat-label">Wasted Compute</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value cyan" id="prob-hits">0%</div>
+            <div class="stat-label">Cache Hit Rate</div>
+          </div>
+        </div>
+        <div class="callout" id="prob-callout">
+          <strong>The same system prompt is recomputed on every pod.</strong>
+          Without cache-aware routing, the load balancer sends identical prefixes to different replicas — tripling the compute cost.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ SCENE 2: BLOCK HASHING ═══════════ -->
+  <div class="scene" id="scene-hashing">
+    <div class="explainer">
+      <div class="explainer-label">In plain terms</div>
+      <h3>How does the system recognize repeated text?</h3>
+      <p>Every prompt gets <strong>broken into small chunks</strong> of tokens (roughly words). Each chunk gets a unique <em>fingerprint</em> — a short code that identifies it.</p>
+      <p>If two requests start with the same words, their fingerprints will <strong>match exactly</strong>. The system sees the match and says: "I already computed this part — I can skip it."</p>
+      <div class="analogy">Think of it like tire telemetry data in F1. Each set of conditions (track temp, tire compound, fuel load) gets a unique signature. If a car encounters the <strong>same conditions again</strong>, the team already knows the optimal setup — no need to run practice laps again.</div>
+      <p>The <strong>"extra" field</strong> is a safety mechanism. It adds a namespace (like a tenant ID or model adapter name) to the hash, so two different customers with the same prompt don't accidentally share cached data.</p>
+      <div class="takeaway"><strong>Bottom line:</strong> Fingerprinting makes prefix reuse fast and safe. No data is transferred to check — just a quick hash comparison.</div>
+    </div>
+    <div class="scene-content with-explainer">
+      <div class="scene-title">Block Hashing</div>
+      <div class="scene-subtitle">FNV-64a chained hashing creates unique fingerprints for cached KV blocks</div>
+      <div class="hash-container" id="hash-vis">
+        <div class="prompt-display" id="prompt-display"></div>
+        <div class="block-chain" id="block-chain"></div>
+        <div class="callout" id="hash-callout">
+          <strong>Chained hashing</strong> — each block's hash depends on its parent, creating a unique fingerprint for any prefix.
+          The <strong>extra</strong> field (LoRA adapter, tenant ID) prevents cross-tenant cache pollution.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ SCENE 3: INDEXER ═══════════ -->
+  <div class="scene" id="scene-indexer">
+    <div class="explainer" style="right: 24px; top: 50%; width: 280px;">
+      <div class="explainer-label">In plain terms</div>
+      <h3>The central directory</h3>
+      <p>The indexer is like a <strong>library catalog</strong>. It doesn't hold the actual data — it just knows <em>which server</em> has <em>which cached blocks</em>, and whether they're in fast memory or slower storage.</p>
+      <div class="analogy">Like a race strategist with a telemetry dashboard — they know which car has warm tires, which has fresh fuel, and which pit crew is ready. When the next pitstop call comes, they route the car to the <strong>crew that's already prepped</strong>.</div>
+      <p>Events stream in <strong>real-time</strong>. The index is best-effort, not a guarantee — but close enough for smart routing decisions.</p>
+      <div class="takeaway"><strong>Bottom line:</strong> One central service knows what's cached where, so routing can be intelligent instead of random.</div>
+    </div>
+    <div class="scene-content with-explainer">
+      <div class="scene-title">KV-Cache Indexer</div>
+      <div class="scene-subtitle">Real-time block locality tracking via KVEvents (ZMQ PUB/SUB)</div>
+      <div class="arch-container" id="indexer-arch">
+        <div class="arch-row" style="gap: 24px; margin-bottom: 30px;">
+          <div class="pod-node" style="min-width:160px" id="idx-pod0">
+            <div class="pod-header">vLLM Pod 0</div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" style="width:70%"></div></div>
+            </div>
+            <div class="tier-bar">
+              <span class="tier-label cpu">CPU</span>
+              <div class="tier-track"><div class="tier-fill cpu" style="width:30%"></div></div>
+            </div>
+          </div>
+          <div class="pod-node" style="min-width:160px" id="idx-pod1">
+            <div class="pod-header">vLLM Pod 1</div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" style="width:50%"></div></div>
+            </div>
+            <div class="tier-bar">
+              <span class="tier-label cpu">CPU</span>
+              <div class="tier-track"><div class="tier-fill cpu" style="width:40%"></div></div>
+            </div>
+          </div>
+          <div class="pod-node" style="min-width:160px" id="idx-pod2">
+            <div class="pod-header">vLLM Pod 2</div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" style="width:60%"></div></div>
+            </div>
+            <div class="tier-bar">
+              <span class="tier-label cpu">CPU</span>
+              <div class="tier-track"><div class="tier-fill cpu" style="width:20%"></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="arch-row" style="margin-bottom: 16px;">
+          <div class="arch-node highlight" id="idx-indexer" style="min-width: 300px;">
+            <div class="node-label" style="color: var(--cyan);">KV-Cache Indexer</div>
+            <div class="node-detail">Block locality index — <span id="idx-count">0</span> blocks tracked</div>
+          </div>
+        </div>
+        <div class="stats-row" style="margin-top: 10px;">
+          <div class="stat-card">
+            <div class="stat-value cyan" id="idx-events">0</div>
+            <div class="stat-label">Events Ingested</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value green" id="idx-pods">3</div>
+            <div class="stat-label">Pods Tracked</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value yellow" id="idx-tiers">2</div>
+            <div class="stat-label">Cache Tiers</div>
+          </div>
+        </div>
+        <div class="callout" id="idx-callout">
+          <strong>KVEvents</strong> stream via ZMQ PUB/SUB as blocks are created/evicted.
+          The indexer builds a global view: <strong>which blocks</strong> live on <strong>which pods</strong> at <strong>which tier</strong>.
+        </div>
+      </div>
+      <div class="event-stream" id="event-stream">
+        <div class="event-stream-title">KVEvent Stream</div>
+        <div id="event-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ SCENE 4: ROUTING ═══════════ -->
+  <div class="scene" id="scene-routing">
+    <div class="explainer">
+      <div class="explainer-label">In plain terms</div>
+      <h3>Same 3 requests — totally different outcome</h3>
+      <p>This is the <strong>same scenario from slide 2</strong>: three users send requests with the same system prompt. But now the router is <em>cache-aware</em>.</p>
+      <p>Request 1 still has to do full prefill — nothing is cached yet. But the router sends it to <strong>one specific pod</strong>, which caches the result.</p>
+      <p>Requests 2 and 3 arrive and the router checks the index: "Pod 0 already has this prefix cached in GPU." It routes both there — and they <strong>skip prefill entirely</strong>.</p>
+      <div class="analogy">Back to the F1 race: the first car still does the formation lap. But now cars 2 and 3 are sent to the <strong>same pit crew</strong> that already has warm tires and fuel ready — they skip the formation lap and go straight to racing.</div>
+      <p>Watch the <strong>TTFT counters</strong> on the left — the first request takes ~850ms, but the cached requests complete in ~52ms. That's a <em>16x improvement</em> just from routing smarter.</p>
+      <div class="takeaway"><strong>Bottom line:</strong> Same 3 requests. Slide 2 wasted 2,550ms of GPU compute. Here, total TTFT is 954ms — a 63% reduction, with zero hardware changes.</div>
+    </div>
+    <div class="scene-content with-explainer">
+      <div class="scene-title">Cache-Aware Routing</div>
+      <div class="scene-subtitle">Same 3 requests as slide 2 — now with intelligent routing. Watch the difference.</div>
+      <div class="arch-container" id="routing-arch">
+        <!-- Top row: clients + router + indexer -->
+        <div class="arch-row" style="margin-bottom: 20px; gap: 32px;">
+          <div class="arch-node" id="rt-client">
+            <div class="node-label">3 Clients</div>
+            <div class="node-detail">Same system prompt as slide 2</div>
+          </div>
+          <div class="arch-node" id="rt-router">
+            <div class="node-label">Cache-Aware Router</div>
+            <div class="node-detail">Query index → score pods → route</div>
+          </div>
+          <div class="arch-node highlight" id="rt-indexer">
+            <div class="node-label" style="color:var(--cyan)">KV-Cache Indexer</div>
+            <div class="node-detail">Score pods by prefix match</div>
+          </div>
+        </div>
+        <!-- Pods row -->
+        <div class="arch-row" style="gap: 24px; margin-bottom: 16px;">
+          <div class="pod-node" id="rt-pod0">
+            <div class="pod-header">
+              <span>vLLM Pod 0</span>
+              <span class="pod-score" id="rt-score0"></span>
+            </div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" id="rt-gpu0" style="width:0%"></div></div>
+              <span class="tier-pct" id="rt-gpu0-pct">0%</span>
+            </div>
+            <div style="font-size:12px; margin-top:6px; text-align:center; opacity:0; transition: opacity 0.3s;" id="rt-status0">&nbsp;</div>
+          </div>
+          <div class="pod-node" id="rt-pod1">
+            <div class="pod-header">
+              <span>vLLM Pod 1</span>
+              <span class="pod-score" id="rt-score1"></span>
+            </div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" style="width:0%"></div></div>
+            </div>
+            <div style="font-size:12px; margin-top:6px; text-align:center; opacity:0;" id="rt-status1">&nbsp;</div>
+          </div>
+          <div class="pod-node" id="rt-pod2">
+            <div class="pod-header">
+              <span>vLLM Pod 2</span>
+              <span class="pod-score" id="rt-score2"></span>
+            </div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" style="width:0%"></div></div>
+            </div>
+            <div style="font-size:12px; margin-top:6px; text-align:center; opacity:0;" id="rt-status2">&nbsp;</div>
+          </div>
+        </div>
+        <!-- Before / After comparison -->
+        <div style="display:flex; gap:20px; justify-content:center; width:100%; margin-top: 8px;">
+          <!-- Before (from slide 2) -->
+          <div style="flex:1; max-width:300px; background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:16px; opacity:0.3; transition: opacity 0.5s;" id="rt-before-card">
+            <div style="font-size:12px; font-weight:600; color:var(--red); margin-bottom:10px; text-transform:uppercase; letter-spacing:1px;">Slide 2 — Without Cache Routing</div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+              <span style="font-size:12px; color:var(--text-dim);">Request 1 TTFT</span>
+              <span style="font-size:13px; font-weight:600; color:var(--red);">850ms</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+              <span style="font-size:12px; color:var(--text-dim);">Request 2 TTFT</span>
+              <span style="font-size:13px; font-weight:600; color:var(--red);">850ms</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+              <span style="font-size:12px; color:var(--text-dim);">Request 3 TTFT</span>
+              <span style="font-size:13px; font-weight:600; color:var(--red);">850ms</span>
+            </div>
+            <div style="border-top:1px solid var(--border); padding-top:8px; display:flex; justify-content:space-between;">
+              <span style="font-size:12px; font-weight:600; color:var(--text-dim);">Total</span>
+              <span style="font-size:15px; font-weight:700; color:var(--red);">2,550ms</span>
+            </div>
+          </div>
+          <!-- After (this slide) -->
+          <div style="flex:1; max-width:300px; background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:16px; opacity:0.3; transition: opacity 0.5s;" id="rt-after-card">
+            <div style="font-size:12px; font-weight:600; color:var(--green); margin-bottom:10px; text-transform:uppercase; letter-spacing:1px;">Now — With Cache-Aware Routing</div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+              <span style="font-size:12px; color:var(--text-dim);">Request 1 TTFT</span>
+              <span style="font-size:13px; font-weight:600; color:var(--yellow); opacity:0; transition: opacity 0.3s;" id="rt-ttft1">850ms <span style="font-size:10px;color:var(--text-dim)">(cold)</span></span>
+            </div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+              <span style="font-size:12px; color:var(--text-dim);">Request 2 TTFT</span>
+              <span style="font-size:13px; font-weight:600; color:var(--green); opacity:0; transition: opacity 0.3s;" id="rt-ttft2">52ms <span style="font-size:10px;color:var(--text-dim)">(cache hit)</span></span>
+            </div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+              <span style="font-size:12px; color:var(--text-dim);">Request 3 TTFT</span>
+              <span style="font-size:13px; font-weight:600; color:var(--green); opacity:0; transition: opacity 0.3s;" id="rt-ttft3">52ms <span style="font-size:10px;color:var(--text-dim)">(cache hit)</span></span>
+            </div>
+            <div style="border-top:1px solid var(--border); padding-top:8px; display:flex; justify-content:space-between; opacity:0; transition: opacity 0.5s;" id="rt-total-row">
+              <span style="font-size:12px; font-weight:600; color:var(--text-dim);">Total</span>
+              <span style="font-size:15px; font-weight:700; color:var(--green);">954ms</span>
+            </div>
+          </div>
+          <!-- Improvement -->
+          <div style="flex:0 0 160px; display:flex; flex-direction:column; gap:8px; justify-content:center;">
+            <div class="stat-card" style="opacity:0; transition: opacity 0.5s;" id="rt-improve1">
+              <div class="stat-value green" style="font-size:20px;">63% faster</div>
+              <div class="stat-label">Total TTFT Reduction</div>
+            </div>
+            <div class="stat-card" style="opacity:0; transition: opacity 0.5s;" id="rt-improve2">
+              <div class="stat-value cyan" style="font-size:20px;">16x</div>
+              <div class="stat-label">Cache Hit Speedup</div>
+            </div>
+            <div class="stat-card" style="opacity:0; transition: opacity 0.5s;" id="rt-improve3">
+              <div class="stat-value yellow" style="font-size:20px;">3x → 1x</div>
+              <div class="stat-label">Prefill Compute</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ SCENE 5: TIERED OFFLOADING ═══════════ -->
+  <div class="scene" id="scene-tiering">
+    <div class="explainer">
+      <div class="explainer-label">In plain terms</div>
+      <h3>A three-level cache</h3>
+      <p>GPU memory is <strong>blazing fast but tiny and expensive</strong> (~80 GB per GPU). When it fills up, older cached data doesn't just vanish — it <em>moves down</em> to a cheaper, bigger tier.</p>
+      <p><strong>Tier 1 — GPU memory:</strong> Fastest. This is where active inference happens. Like the top of your desk — everything is within arm's reach.</p>
+      <p><strong>Tier 2 — CPU memory:</strong> Still fast. Transfers happen asynchronously in the background, so inference isn't blocked. Like a filing cabinet beside your desk.</p>
+      <p><strong>Tier 3 — Shared storage:</strong> Slowest, but massive, cheap, and <em>persistent</em>. Data survives pod restarts. Any pod in the cluster can access it. Like a warehouse down the street.</p>
+      <div class="analogy">Think of it like F1 tire strategy: hot tires on the car (GPU) are fastest. Pre-warmed spares in the pit lane (CPU) are ready in seconds. Cold spares in the garage (storage) take longer to prep — but still <strong>16.8x faster than manufacturing new tires mid-race</strong>.</div>
+      <div class="takeaway"><strong>Bottom line:</strong> Instead of throwing away cached data when GPU is full, it cascades to cheaper storage. More cache = more hits = less wasted compute.</div>
+    </div>
+    <div class="scene-content with-explainer">
+      <div class="scene-title">Tiered KV Cache Offloading</div>
+      <div class="scene-subtitle">GPU HBM → CPU DRAM → Shared Storage — automatic cascade under pressure</div>
+      <div class="arch-container" id="tiering-arch">
+        <div class="arch-row" style="gap: 28px; margin-bottom: 24px;">
+          <div class="pod-node" id="tier-pod" style="min-width: 340px;">
+            <div class="pod-header">vLLM Pod 0 — Cache Tiers</div>
+            <div class="tier-bar">
+              <span class="tier-label gpu">GPU</span>
+              <div class="tier-track"><div class="tier-fill gpu" id="tier-gpu" style="width:0%"></div></div>
+              <span class="tier-pct" id="tier-gpu-pct">0%</span>
+            </div>
+            <div class="tier-bar">
+              <span class="tier-label cpu">CPU</span>
+              <div class="tier-track"><div class="tier-fill cpu" id="tier-cpu" style="width:0%"></div></div>
+              <span class="tier-pct" id="tier-cpu-pct">0%</span>
+            </div>
+            <div class="tier-bar">
+              <span class="tier-label fs">FS</span>
+              <div class="tier-track"><div class="tier-fill fs" id="tier-fs" style="width:0%"></div></div>
+              <span class="tier-pct" id="tier-fs-pct">0%</span>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:8px;min-width:200px;">
+            <div class="stat-card">
+              <div class="stat-value green" id="tier-step-label">Idle</div>
+              <div class="stat-label">Current Phase</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-value cyan" id="tier-total-blocks">0</div>
+              <div class="stat-label">Total KV Blocks</div>
+            </div>
+          </div>
+        </div>
+        <div class="shared-storage" id="tier-storage">
+          <div class="storage-label">Shared Filesystem (CephFS / Lustre / NVMe)</div>
+          <div class="storage-detail">Persistent • Cross-replica • Directory-as-index • File-per-block</div>
+          <div class="storage-blocks" id="tier-storage-blocks"></div>
+        </div>
+        <div class="stats-row" style="margin-top: 16px;">
+          <div class="stat-card">
+            <div class="stat-value" style="color:var(--gpu-color);font-size:14px;">~3.35 TB/s</div>
+            <div class="stat-label">GPU HBM Bandwidth</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" style="color:var(--cpu-color);font-size:14px;">~200 GB/s</div>
+            <div class="stat-label">CPU DRAM (async)</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" style="color:var(--storage-color);font-size:14px;">~6 GB/s</div>
+            <div class="stat-label">Storage I/O</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value green" style="font-size:14px;">16.8x</div>
+            <div class="stat-label">vs Prefill (long prompts)</div>
+          </div>
+        </div>
+        <div class="callout" id="tier-callout">
+          <strong>Async pipelined offloading</strong> — GPU→CPU transfers overlap with compute.
+          The <strong>llm-d FS backend</strong> stores blocks as files on shared storage, enabling cross-replica reuse and persistence across restarts.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ SCENE 6: BENCHMARKS ═══════════ -->
+  <div class="scene" id="scene-benchmarks">
+    <div class="explainer">
+      <div class="explainer-label">In plain terms</div>
+      <h3>Reading the numbers</h3>
+      <p><strong>TTFT</strong> (Time to First Token) is how long a user waits before the AI starts typing back. Lower is better — it's the "thinking..." delay.</p>
+      <p><strong>Throughput</strong> is how many tokens (roughly words) the whole system processes per second across all users. Higher means you can serve more people.</p>
+      <p>The <strong>yellow bars</strong> show the baseline: vLLM with GPU + CPU caching only. The <strong>green bars</strong> show what happens when you add a shared storage tier on top.</p>
+      <div class="analogy">Like sharing telemetry data across the whole racing fleet. Any car in the team can benefit from data collected by any other car. The more laps (longer prompts) the data covers, the <strong>bigger the advantage</strong>.</div>
+      <p>The gains are strongest with <strong>long system prompts</strong> (50K-70K tokens) because there's more reusable prefix to cache. At 70K tokens, the storage tier saves ~13 seconds of user wait time per request.</p>
+      <div class="takeaway"><strong>Bottom line:</strong> 20-29% more throughput means you can serve the same traffic with fewer GPUs — or handle 29% more users with the same hardware.</div>
+    </div>
+    <div class="scene-content with-explainer">
+      <div class="scene-title">Performance Impact</div>
+      <div class="scene-subtitle">Published benchmarks: vLLM + CPU offloading vs + Lustre shared storage (LMCache connector)</div>
+      <div style="display:flex;gap:40px;flex:1;align-items:flex-start;margin-top:12px;">
+        <div style="flex:1;">
+          <div class="bench-group">
+            <div class="bench-title" style="color:var(--cyan)">50K Token System Prompt</div>
+            <div class="bench-row">
+              <div class="bench-label">Mean TTFT</div>
+              <div class="bench-track"><div class="bench-fill baseline" id="b50-ttft-base" data-target="85">25.38s</div></div>
+              <div class="bench-change" id="b50-ttft-change"></div>
+            </div>
+            <div class="bench-row">
+              <div class="bench-label">(+ Storage)</div>
+              <div class="bench-track"><div class="bench-fill improved" id="b50-ttft-new" data-target="67">20.12s</div></div>
+              <div class="bench-change good" id="b50-ttft-pct"></div>
+            </div>
+            <div class="bench-row" style="margin-top: 8px;">
+              <div class="bench-label">Throughput</div>
+              <div class="bench-track"><div class="bench-fill baseline" id="b50-tp-base" data-target="72">18,962 tok/s</div></div>
+              <div class="bench-change" id="b50-tp-change"></div>
+            </div>
+            <div class="bench-row">
+              <div class="bench-label">(+ Storage)</div>
+              <div class="bench-track"><div class="bench-fill improved" id="b50-tp-new" data-target="88">23,262 tok/s</div></div>
+              <div class="bench-change good" id="b50-tp-pct"></div>
+            </div>
+          </div>
+          <div class="bench-group">
+            <div class="bench-title" style="color:var(--cyan)">70K Token System Prompt</div>
+            <div class="bench-row">
+              <div class="bench-label">Mean TTFT</div>
+              <div class="bench-track"><div class="bench-fill baseline" id="b70-ttft-base" data-target="93">58.02s</div></div>
+              <div class="bench-change" id="b70-ttft-change"></div>
+            </div>
+            <div class="bench-row">
+              <div class="bench-label">(+ Storage)</div>
+              <div class="bench-track"><div class="bench-fill improved" id="b70-ttft-new" data-target="72">45.00s</div></div>
+              <div class="bench-change good" id="b70-ttft-pct"></div>
+            </div>
+            <div class="bench-row" style="margin-top: 8px;">
+              <div class="bench-label">Throughput</div>
+              <div class="bench-track"><div class="bench-fill baseline" id="b70-tp-base" data-target="64">16,825 tok/s</div></div>
+              <div class="bench-change" id="b70-tp-change"></div>
+            </div>
+            <div class="bench-row">
+              <div class="bench-label">(+ Storage)</div>
+              <div class="bench-track"><div class="bench-fill improved" id="b70-tp-new" data-target="82">21,656 tok/s</div></div>
+              <div class="bench-change good" id="b70-tp-pct"></div>
+            </div>
+          </div>
+        </div>
+        <div style="width:280px;display:flex;flex-direction:column;gap:12px;">
+          <div class="stat-card highlight" style="opacity:0;transition:all 0.6s 0.8s;" id="bench-stat1">
+            <div class="stat-value green">~20-22%</div>
+            <div class="stat-label">TTFT Reduction</div>
+          </div>
+          <div class="stat-card highlight" style="opacity:0;transition:all 0.6s 1.2s;" id="bench-stat2">
+            <div class="stat-value green">~23-29%</div>
+            <div class="stat-label">Throughput Gain</div>
+          </div>
+          <div class="stat-card highlight" style="opacity:0;transition:all 0.6s 1.6s;" id="bench-stat3">
+            <div class="stat-value cyan">16.8x</div>
+            <div class="stat-label">vs Full Prefill</div>
+          </div>
+          <div class="stat-card highlight" style="opacity:0;transition:all 0.6s 2.0s;" id="bench-stat4">
+            <div class="stat-value yellow">~9x</div>
+            <div class="stat-label">Throughput (preemption)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ SCENE 7: SUMMARY ═══════════ -->
+  <div class="scene" id="scene-summary">
+    <div class="scene-content" style="align-items:center;justify-content:center;">
+      <div class="scene-title" style="text-align:center;font-size:36px;margin-bottom:32px;">Key Takeaways</div>
+      <div class="summary-grid">
+        <div class="summary-card" id="sum0">
+          <div class="summary-stat" style="color:var(--cyan);">2-Layer</div>
+          <div class="summary-desc">Control plane (indexer + router) + Data plane (offloading connectors + FS backend)</div>
+        </div>
+        <div class="summary-card" id="sum1">
+          <div class="summary-stat" style="color:var(--green);">3 Tiers</div>
+          <div class="summary-desc">GPU HBM → CPU DRAM → Shared Storage<br>Automatic cascade, async pipelined</div>
+        </div>
+        <div class="summary-card" id="sum2">
+          <div class="summary-stat" style="color:var(--yellow);">FNV-64a</div>
+          <div class="summary-desc">Chained block hashing with cache differentiation via extra field (LoRA, tenant)</div>
+        </div>
+        <div class="summary-card" id="sum3">
+          <div class="summary-stat" style="color:var(--green);">20-29%</div>
+          <div class="summary-desc">Throughput improvement with shared storage tier (published benchmarks)</div>
+        </div>
+        <div class="summary-card" id="sum4">
+          <div class="summary-stat" style="color:var(--cyan);">16.8x</div>
+          <div class="summary-desc">Speedup vs full prefill on long prompts — even from the storage tier</div>
+        </div>
+        <div class="summary-card" id="sum5">
+          <div class="summary-stat" style="color:var(--storage-color);">Persistent</div>
+          <div class="summary-desc">KV cache survives restarts, enables cross-replica reuse on shared filesystem</div>
+        </div>
+      </div>
+      <div class="callout visible" style="margin-top:32px;text-align:center;max-width:700px;">
+        <strong>llm-d</strong> — Distributed, cache-aware LLM inference on Kubernetes.
+        <br>Open source under Apache 2.0.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ SCENE 8: RESOURCES ═══════════ -->
+  <div class="scene" id="scene-resources">
+    <div class="scene-content" style="align-items:center;justify-content:center;">
+      <div class="scene-title" style="text-align:center;font-size:36px;margin-bottom:12px;">Learn More</div>
+      <div class="scene-subtitle" style="text-align:center;max-width:600px;margin:0 auto 32px;">Dive deeper into llm-d, vLLM, and cache-aware inference with these resources.</div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 900px; width: 100%;">
+        <!-- Blog -->
+        <div class="summary-card" id="res0" style="text-align:left;padding:20px 24px;">
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--red);margin-bottom:10px;">Red Hat Blog</div>
+          <a href="https://www.redhat.com/en/blog/demystifying-llm-d-and-vllm-race-production" target="_blank" rel="noopener" style="color:var(--cyan);font-size:16px;font-weight:600;text-decoration:none;line-height:1.4;display:block;margin-bottom:8px;">Demystifying llm-d and vLLM: The Race to Production</a>
+          <div class="summary-desc">The F1 racing analogy that inspired this demo — how vLLM is the race car and llm-d is the pit crew, strategist, and telemetry system. By Christopher Nuland &amp; Carlos Condado.</div>
+        </div>
+        <!-- KV Cache Routing Blog -->
+        <div class="summary-card" id="res1" style="text-align:left;padding:20px 24px;">
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--red);margin-bottom:10px;">Red Hat Developer</div>
+          <a href="https://developers.redhat.com/articles/2025/12/16/master-kv-cache-aware-routing-llm-d-efficient-ai-inference" target="_blank" rel="noopener" style="color:var(--cyan);font-size:16px;font-weight:600;text-decoration:none;line-height:1.4;display:block;margin-bottom:8px;">Master KV Cache Aware Routing with llm-d</a>
+          <div class="summary-desc">Deep dive into cache-aware routing — how the KV-Cache Indexer, block hashing, and tier-weighted scoring work together.</div>
+        </div>
+        <!-- llm-d KV Cache repo -->
+        <div class="summary-card" id="res2" style="text-align:left;padding:20px 24px;">
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--cyan);margin-bottom:10px;">GitHub</div>
+          <a href="https://github.com/llm-d/llm-d-kv-cache" target="_blank" rel="noopener" style="color:var(--cyan);font-size:16px;font-weight:600;text-decoration:none;line-height:1.4;display:block;margin-bottom:8px;">llm-d/llm-d-kv-cache</a>
+          <div class="summary-desc">The KV-Cache Indexer source code — cache-aware routing and cross-node cache coordination for vLLM-based serving. Apache 2.0.</div>
+        </div>
+        <!-- vLLM Offloading Connector -->
+        <div class="summary-card" id="res3" style="text-align:left;padding:20px 24px;">
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--cyan);margin-bottom:10px;">vLLM Blog</div>
+          <a href="https://blog.vllm.ai/2025/01/27/kv-cache-offloading-connector.html" target="_blank" rel="noopener" style="color:var(--cyan);font-size:16px;font-weight:600;text-decoration:none;line-height:1.4;display:block;margin-bottom:8px;">KV Cache Offloading Connector</a>
+          <div class="summary-desc">vLLM's offloading connector design — async pipelined GPU↔CPU transfer, 2x-22x TTFT reduction, up to 9x throughput gains.</div>
+        </div>
+        <!-- NVIDIA blog -->
+        <div class="summary-card" id="res4" style="text-align:left;padding:20px 24px;">
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--green);margin-bottom:10px;">NVIDIA Technical Blog</div>
+          <a href="https://developer.nvidia.com/blog/how-to-reduce-kv-cache-bottlenecks-with-nvidia-dynamo/" target="_blank" rel="noopener" style="color:var(--cyan);font-size:16px;font-weight:600;text-decoration:none;line-height:1.4;display:block;margin-bottom:8px;">Reduce KV Cache Bottlenecks with NVIDIA Dynamo</a>
+          <div class="summary-desc">NVIDIA's perspective on KV cache bottlenecks, lossiness in event streams, and Dynamo integration with llm-d.</div>
+        </div>
+        <!-- llm-d FS backend blog -->
+        <div class="summary-card" id="res5" style="text-align:left;padding:20px 24px;">
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--green);margin-bottom:10px;">llm-d Blog</div>
+          <a href="https://llm-d.github.io/docs/blog/" target="_blank" rel="noopener" style="color:var(--cyan);font-size:16px;font-weight:600;text-decoration:none;line-height:1.4;display:block;margin-bottom:8px;">KV-Cache Wins You Can See</a>
+          <div class="summary-desc">From prefix caching in vLLM to distributed scheduling with llm-d — FS backend benchmarks and tiered offloading guides.</div>
+        </div>
+      </div>
+      <div style="text-align:center;margin-top:36px;">
+        <p style="color: var(--text); font-size: 15px;">Christopher Nuland</p>
+        <p style="color: var(--text-dim); font-size: 13px; margin-top: 4px;">Technical Marketing Manager, AI Inference — Red Hat</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════════
+//  SCENE MANAGEMENT
+// ══════════════════════════════════════════════════════════════
+const SCENE_IDS = [
+  'scene-intro', 'scene-problem', 'scene-hashing',
+  'scene-indexer', 'scene-routing', 'scene-tiering',
+  'scene-benchmarks', 'scene-summary', 'scene-resources'
+];
+const SCENE_LABELS = [
+  'Introduction', 'The Problem', 'Block Hashing',
+  'KV-Cache Indexer', 'Cache-Aware Routing', 'Tiered Offloading',
+  'Performance Benchmarks', 'Summary', 'Learn More'
+];
+
+let currentScene = 0;
+let autoPlay = false;
+let autoTimer = null;
+let sceneTimers = [];
+const AUTO_DELAY = 25000;
+
+function initDots() {
+  const container = document.getElementById('scene-dots');
+  SCENE_IDS.forEach((_, i) => {
+    const dot = document.createElement('div');
+    dot.className = 'scene-dot' + (i === 0 ? ' active' : '');
+    dot.onclick = () => goToScene(i);
+    container.appendChild(dot);
+  });
+}
+
+function updateDots() {
+  document.querySelectorAll('.scene-dot').forEach((dot, i) => {
+    dot.className = 'scene-dot' + (i === currentScene ? ' active' : i < currentScene ? ' done' : '');
+  });
+}
+
+function goToScene(idx) {
+  if (idx < 0 || idx >= SCENE_IDS.length) return;
+
+  sceneTimers.forEach(t => clearTimeout(t));
+  sceneTimers = [];
+
+  document.querySelectorAll('.scene').forEach(s => s.classList.remove('active'));
+  currentScene = idx;
+
+  const el = document.getElementById(SCENE_IDS[idx]);
+  el.classList.add('active');
+  document.getElementById('scene-label').textContent = SCENE_LABELS[idx];
+  document.getElementById('progress-fill').style.width = ((idx / (SCENE_IDS.length - 1)) * 100) + '%';
+  updateDots();
+
+  runSceneAnimation(idx);
+
+  if (autoPlay) {
+    clearTimeout(autoTimer);
+    autoTimer = setTimeout(() => nextScene(), AUTO_DELAY);
+  }
+}
+
+function nextScene() { goToScene(currentScene + 1); }
+function prevScene() { goToScene(currentScene - 1); }
+
+function toggleAuto() {
+  autoPlay = !autoPlay;
+  document.getElementById('btn-auto').classList.toggle('active', autoPlay);
+  if (autoPlay) {
+    autoTimer = setTimeout(() => nextScene(), AUTO_DELAY);
+  } else {
+    clearTimeout(autoTimer);
+  }
+}
+
+function scheduleInScene(fn, delay) {
+  sceneTimers.push(setTimeout(fn, delay));
+}
+
+// ══════════════════════════════════════════════════════════════
+//  PARTICLE SYSTEM (Canvas)
+// ══════════════════════════════════════════════════════════════
+const canvas = document.getElementById('particle-canvas');
+const ctx = canvas.getContext('2d');
+let particles = [];
+
+function resizeCanvas() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+class Particle {
+  constructor(x0, y0, x1, y1, color, size = 8, duration = 1500) {
+    this.x0 = x0; this.y0 = y0;
+    this.x1 = x1; this.y1 = y1;
+    this.color = color;
+    this.size = size;
+    this.duration = duration;
+    this.start = performance.now();
+    this.alive = true;
+  }
+
+  update(now) {
+    const t = (now - this.start) / this.duration;
+    if (t >= 1) { this.alive = false; return; }
+    const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    this.x = this.x0 + (this.x1 - this.x0) * ease;
+    this.y = this.y0 + (this.y1 - this.y0) * ease;
+    this.opacity = t < 0.1 ? t / 0.1 : t > 0.85 ? (1 - t) / 0.15 : 1;
+  }
+
+  draw(ctx) {
+    if (!this.alive) return;
+    ctx.save();
+    ctx.globalAlpha = this.opacity;
+    ctx.fillStyle = this.color;
+    ctx.shadowColor = this.color;
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.roundRect(this.x - this.size / 2, this.y - this.size / 2, this.size, this.size, 3);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function spawnParticle(x0, y0, x1, y1, color, size, duration) {
+  particles.push(new Particle(x0, y0, x1, y1, color, size || 8, duration || 1500));
+}
+
+function animateParticles() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const now = performance.now();
+  particles = particles.filter(p => p.alive);
+  particles.forEach(p => { p.update(now); p.draw(ctx); });
+  requestAnimationFrame(animateParticles);
+}
+animateParticles();
+
+function getCenter(el) {
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}
+
+// ══════════════════════════════════════════════════════════════
+//  SCENE ANIMATIONS
+// ══════════════════════════════════════════════════════════════
+
+function runSceneAnimation(idx) {
+  switch (idx) {
+    case 1: animateProblem(); break;
+    case 2: animateHashing(); break;
+    case 3: animateIndexer(); break;
+    case 4: animateRouting(); break;
+    case 5: animateTiering(); break;
+    case 6: animateBenchmarks(); break;
+    case 7: animateSummary(); break;
+    case 8: animateResources(); break;
+  }
+}
+
+// ── SCENE 1: PROBLEM ──
+function animateProblem() {
+  const pods = [0, 1, 2];
+  const gpuEls = pods.map(i => document.getElementById(`prob-gpu${i}`));
+  const pctEls = pods.map(i => document.getElementById(`prob-gpu${i}-pct`));
+  const prefillEls = pods.map(i => document.getElementById(`prob-prefill${i}`));
+  const redundantEl = document.getElementById('prob-redundant');
+  const wastedEl = document.getElementById('prob-wasted');
+  const hitsEl = document.getElementById('prob-hits');
+  const callout = document.getElementById('prob-callout');
+
+  gpuEls.forEach(el => el.style.width = '0%');
+  pctEls.forEach(el => el.textContent = '0%');
+  prefillEls.forEach(el => el.style.opacity = '0');
+  redundantEl.textContent = '0x';
+  wastedEl.textContent = '0ms';
+  hitsEl.textContent = '0%';
+  callout.classList.remove('visible');
+
+  const client = document.getElementById('prob-client');
+  const podNodes = pods.map(i => document.getElementById(`prob-pod${i}`));
+
+  pods.forEach((pod, i) => {
+    scheduleInScene(() => {
+      const from = getCenter(client);
+      const to = getCenter(podNodes[i]);
+      spawnParticle(from.x, from.y, to.x, to.y, '#00d4ff', 12, 800);
+    }, 600 + i * 1200);
+
+    scheduleInScene(() => {
+      prefillEls[i].style.opacity = '1';
+      podNodes[i].classList.add('glow-red');
+      let pct = 0;
+      const iv = setInterval(() => {
+        pct += 5;
+        if (pct > 65) { clearInterval(iv); return; }
+        gpuEls[i].style.width = pct + '%';
+        pctEls[i].textContent = pct + '%';
+      }, 80);
+      sceneTimers.push(iv);
+    }, 1400 + i * 1200);
+
+    scheduleInScene(() => {
+      redundantEl.textContent = (i + 1) + 'x';
+      wastedEl.textContent = ((i + 1) * 850) + 'ms';
+    }, 2000 + i * 1200);
+  });
+
+  scheduleInScene(() => {
+    hitsEl.textContent = '0%';
+    callout.classList.add('visible');
+  }, 5000);
+}
+
+// ── SCENE 2: HASHING ──
+function animateHashing() {
+  const promptEl = document.getElementById('prompt-display');
+  const chainEl = document.getElementById('block-chain');
+  const callout = document.getElementById('hash-callout');
+  callout.classList.remove('visible');
+
+  const words = ['You', 'are', 'a', 'helpful', 'AI', 'assistant', '.', 'Please', 'answer', 'the', 'following', 'question', ':', 'What', 'is', 'machine', 'learning', '?'];
+  const blockSize = 6;
+
+  promptEl.innerHTML = '';
+  words.forEach((w, i) => {
+    const span = document.createElement('span');
+    span.className = 'token';
+    span.textContent = w;
+    span.id = `tok-${i}`;
+    promptEl.appendChild(span);
+    promptEl.appendChild(document.createTextNode(' '));
+  });
+
+  chainEl.innerHTML = '';
+
+  const numBlocks = Math.ceil(words.length / blockSize);
+  const hashes = ['0x3A7F', '0x9C2E', '0xE1B4'];
+
+  for (let b = 0; b < numBlocks; b++) {
+    if (b > 0) {
+      const arrow = document.createElement('span');
+      arrow.className = 'chain-arrow';
+      arrow.textContent = '→';
+      arrow.id = `arrow-${b}`;
+      chainEl.appendChild(arrow);
+    }
+    const block = document.createElement('div');
+    block.className = 'hash-block';
+    block.id = `hblock-${b}`;
+    const startIdx = b * blockSize;
+    const endIdx = Math.min(startIdx + blockSize, words.length);
+    const blockWords = words.slice(startIdx, endIdx).join(' ');
+    block.innerHTML = `
+      <div class="block-idx">Block ${b}</div>
+      <div class="block-hash">${hashes[b] || '0x' + Math.random().toString(16).slice(2, 6).toUpperCase()}</div>
+      <div class="block-tokens">${blockWords}</div>
+    `;
+    chainEl.appendChild(block);
+  }
+
+  for (let b = 0; b < numBlocks; b++) {
+    const startIdx = b * blockSize;
+    const endIdx = Math.min(startIdx + blockSize, words.length);
+    const colors = ['rgba(0,255,136,0.2)', 'rgba(68,136,255,0.2)', 'rgba(204,68,255,0.2)'];
+    const borders = ['var(--green)', 'var(--blue)', 'var(--magenta)'];
+
+    scheduleInScene(() => {
+      for (let i = startIdx; i < endIdx; i++) {
+        const tok = document.getElementById(`tok-${i}`);
+        if (tok) {
+          tok.classList.add('highlighted');
+          tok.style.background = colors[b % 3];
+          tok.style.borderColor = borders[b % 3];
+        }
+      }
+    }, 800 + b * 1200);
+
+    scheduleInScene(() => {
+      const hblock = document.getElementById(`hblock-${b}`);
+      if (hblock) {
+        hblock.classList.add('visible');
+        hblock.style.borderColor = borders[b % 3];
+      }
+      const arrow = document.getElementById(`arrow-${b}`);
+      if (arrow) arrow.classList.add('visible');
+    }, 1400 + b * 1200);
+  }
+
+  scheduleInScene(() => callout.classList.add('visible'), 1400 + numBlocks * 1200);
+}
+
+// ── SCENE 3: INDEXER ──
+function animateIndexer() {
+  const countEl = document.getElementById('idx-count');
+  const eventsEl = document.getElementById('idx-events');
+  const listEl = document.getElementById('event-list');
+  const callout = document.getElementById('idx-callout');
+  callout.classList.remove('visible');
+  listEl.innerHTML = '';
+  countEl.textContent = '0';
+  eventsEl.textContent = '0';
+
+  const pods = ['pod-0', 'pod-1', 'pod-2'];
+  const tiers = ['GPU', 'CPU'];
+  const podEls = [
+    document.getElementById('idx-pod0'),
+    document.getElementById('idx-pod1'),
+    document.getElementById('idx-pod2')
+  ];
+  const indexerEl = document.getElementById('idx-indexer');
+
+  let eventCount = 0;
+  let blockCount = 0;
+
+  for (let i = 0; i < 16; i++) {
+    scheduleInScene(() => {
+      const podIdx = i % 3;
+      const tier = Math.random() > 0.4 ? 'GPU' : 'CPU';
+      const hash = '0x' + Math.random().toString(16).slice(2, 6).toUpperCase();
+
+      const from = getCenter(podEls[podIdx]);
+      const to = getCenter(indexerEl);
+      const color = tier === 'GPU' ? '#00ff88' : '#4488ff';
+      spawnParticle(from.x, from.y, to.x, to.y, '#ffcc00', 6, 600);
+
+      eventCount++;
+      blockCount = Math.min(eventCount, 14);
+      eventsEl.textContent = eventCount;
+      countEl.textContent = blockCount;
+
+      const item = document.createElement('div');
+      item.className = 'event-item';
+      item.innerHTML = `
+        <span class="event-type">STORED</span>
+        <span class="event-pod">${pods[podIdx]}</span>
+        <span>${hash}</span>
+        <span class="${tier === 'GPU' ? 'event-tier-gpu' : 'event-tier-cpu'}">${tier}</span>
+      `;
+      listEl.prepend(item);
+      requestAnimationFrame(() => item.classList.add('visible'));
+
+      if (listEl.children.length > 10) listEl.removeChild(listEl.lastChild);
+    }, 400 + i * 400);
+  }
+
+  scheduleInScene(() => callout.classList.add('visible'), 7200);
+}
+
+// ── SCENE 4: ROUTING (replays slide 2 scenario with cache-aware routing) ──
+function animateRouting() {
+  const scores = [
+    document.getElementById('rt-score0'),
+    document.getElementById('rt-score1'),
+    document.getElementById('rt-score2')
+  ];
+  const podEls = [
+    document.getElementById('rt-pod0'),
+    document.getElementById('rt-pod1'),
+    document.getElementById('rt-pod2')
+  ];
+  const statusEls = [
+    document.getElementById('rt-status0'),
+    document.getElementById('rt-status1'),
+    document.getElementById('rt-status2')
+  ];
+  const gpuEl = document.getElementById('rt-gpu0');
+  const gpuPct = document.getElementById('rt-gpu0-pct');
+  const beforeCard = document.getElementById('rt-before-card');
+  const afterCard = document.getElementById('rt-after-card');
+
+  // Reset everything
+  scores.forEach(s => { s.classList.remove('visible'); s.textContent = ''; });
+  podEls.forEach(p => p.classList.remove('selected'));
+  statusEls.forEach(s => { s.style.opacity = '0'; s.innerHTML = '&nbsp;'; });
+  if (gpuEl) { gpuEl.style.width = '0%'; }
+  if (gpuPct) { gpuPct.textContent = '0%'; }
+  beforeCard.style.opacity = '0.3';
+  afterCard.style.opacity = '0.3';
+  ['rt-ttft1','rt-ttft2','rt-ttft3','rt-total-row','rt-improve1','rt-improve2','rt-improve3'].forEach(id => {
+    document.getElementById(id).style.opacity = '0';
+  });
+
+  const clientEl = document.getElementById('rt-client');
+  const routerEl = document.getElementById('rt-router');
+  const indexerEl = document.getElementById('rt-indexer');
+
+  // Show the "before" card first for context
+  scheduleInScene(() => {
+    beforeCard.style.opacity = '1';
+  }, 300);
+
+  // ── REQUEST 1: Cold start ──
+  scheduleInScene(() => {
+    afterCard.style.opacity = '1';
+    const from = getCenter(clientEl);
+    const to = getCenter(routerEl);
+    spawnParticle(from.x, from.y, to.x, to.y, '#00d4ff', 12, 700);
+  }, 1200);
+
+  // Router queries indexer
+  scheduleInScene(() => {
+    const from = getCenter(routerEl);
+    const to = getCenter(indexerEl);
+    spawnParticle(from.x, from.y, to.x, to.y, '#ffcc00', 8, 500);
+    scores[0].textContent = '0.00';
+    scores[0].style.color = 'var(--text-dim)';
+    scores[0].classList.add('visible');
+  }, 2100);
+
+  // No cache yet → route to Pod 0 (least loaded)
+  scheduleInScene(() => {
+    const from = getCenter(routerEl);
+    const to = getCenter(podEls[0]);
+    spawnParticle(from.x, from.y, to.x, to.y, '#00d4ff', 12, 700);
+    statusEls[0].style.opacity = '1';
+    statusEls[0].innerHTML = '<span style="color:var(--yellow)">PREFILL (cold start)...</span>';
+  }, 2800);
+
+  // Prefill completes, GPU fills, TTFT shows
+  scheduleInScene(() => {
+    if (gpuEl) gpuEl.style.width = '65%';
+    if (gpuPct) gpuPct.textContent = '65%';
+    statusEls[0].innerHTML = '<span style="color:var(--green)">CACHED ✓</span>';
+    podEls[0].classList.add('selected');
+    document.getElementById('rt-ttft1').style.opacity = '1';
+  }, 4200);
+
+  // ── REQUEST 2: Cache hit! ──
+  scheduleInScene(() => {
+    const from = getCenter(clientEl);
+    const to = getCenter(routerEl);
+    spawnParticle(from.x, from.y, to.x, to.y, '#00d4ff', 12, 700);
+  }, 5500);
+
+  // Router queries indexer → Pod 0 has high score
+  scheduleInScene(() => {
+    const from = getCenter(routerEl);
+    const to = getCenter(indexerEl);
+    spawnParticle(from.x, from.y, to.x, to.y, '#ffcc00', 8, 500);
+    scores[0].textContent = '0.95';
+    scores[0].style.color = 'var(--green)';
+    scores[1].textContent = '0.00';
+    scores[1].style.color = 'var(--text-dim)';
+    scores[1].classList.add('visible');
+    scores[2].textContent = '0.00';
+    scores[2].style.color = 'var(--text-dim)';
+    scores[2].classList.add('visible');
+  }, 6400);
+
+  // Route to Pod 0 — cache hit
+  scheduleInScene(() => {
+    const from = getCenter(routerEl);
+    const to = getCenter(podEls[0]);
+    spawnParticle(from.x, from.y, to.x, to.y, '#00ff88', 12, 600);
+  }, 7100);
+
+  scheduleInScene(() => {
+    statusEls[0].innerHTML = '<span style="color:var(--green)">CACHE HIT — skip prefill ✓</span>';
+    document.getElementById('rt-ttft2').style.opacity = '1';
+  }, 7800);
+
+  // ── REQUEST 3: Cache hit again! ──
+  scheduleInScene(() => {
+    const from = getCenter(clientEl);
+    const to = getCenter(routerEl);
+    spawnParticle(from.x, from.y, to.x, to.y, '#00d4ff', 12, 700);
+  }, 9000);
+
+  scheduleInScene(() => {
+    const from = getCenter(routerEl);
+    const to = getCenter(podEls[0]);
+    spawnParticle(from.x, from.y, to.x, to.y, '#00ff88', 12, 600);
+  }, 9800);
+
+  scheduleInScene(() => {
+    document.getElementById('rt-ttft3').style.opacity = '1';
+  }, 10500);
+
+  // Show totals and improvement cards
+  scheduleInScene(() => {
+    document.getElementById('rt-total-row').style.opacity = '1';
+  }, 11500);
+
+  scheduleInScene(() => {
+    document.getElementById('rt-improve1').style.opacity = '1';
+  }, 12200);
+
+  scheduleInScene(() => {
+    document.getElementById('rt-improve2').style.opacity = '1';
+  }, 12800);
+
+  scheduleInScene(() => {
+    document.getElementById('rt-improve3').style.opacity = '1';
+  }, 13400);
+}
+
+// ── SCENE 5: TIERING ──
+function animateTiering() {
+  const gpuEl = document.getElementById('tier-gpu');
+  const cpuEl = document.getElementById('tier-cpu');
+  const fsEl = document.getElementById('tier-fs');
+  const gpuPct = document.getElementById('tier-gpu-pct');
+  const cpuPct = document.getElementById('tier-cpu-pct');
+  const fsPct = document.getElementById('tier-fs-pct');
+  const stepLabel = document.getElementById('tier-step-label');
+  const totalBlocks = document.getElementById('tier-total-blocks');
+  const storageEl = document.getElementById('tier-storage');
+  const callout = document.getElementById('tier-callout');
+  const storageBlocks = document.getElementById('tier-storage-blocks');
+
+  gpuEl.style.width = '0%'; cpuEl.style.width = '0%'; fsEl.style.width = '0%';
+  gpuPct.textContent = '0%'; cpuPct.textContent = '0%'; fsPct.textContent = '0%';
+  stepLabel.textContent = 'Idle';
+  totalBlocks.textContent = '0';
+  storageEl.classList.remove('highlight');
+  callout.classList.remove('visible');
+  storageBlocks.innerHTML = '';
+
+  for (let i = 0; i < 30; i++) {
+    const b = document.createElement('div');
+    b.className = 'storage-block-mini';
+    b.id = `sb-${i}`;
+    storageBlocks.appendChild(b);
+  }
+
+  const steps = [
+    { gpu: 30, cpu: 0, fs: 0, label: 'Warm-up', total: 24, delay: 500 },
+    { gpu: 55, cpu: 0, fs: 0, label: 'Users arriving', total: 48, delay: 2000 },
+    { gpu: 85, cpu: 0, fs: 0, label: 'GPU filling', total: 72, delay: 3500 },
+    { gpu: 90, cpu: 35, fs: 0, label: 'Offload → CPU', total: 108, delay: 5000 },
+    { gpu: 92, cpu: 70, fs: 0, label: 'CPU filling', total: 148, delay: 6500 },
+    { gpu: 88, cpu: 85, fs: 25, label: 'Offload → Storage', total: 196, delay: 8000 },
+    { gpu: 85, cpu: 80, fs: 55, label: 'Cross-replica reuse', total: 256, delay: 9500 },
+  ];
+
+  const podEl = document.getElementById('tier-pod');
+
+  steps.forEach(step => {
+    scheduleInScene(() => {
+      gpuEl.style.width = step.gpu + '%'; gpuPct.textContent = step.gpu + '%';
+      cpuEl.style.width = step.cpu + '%'; cpuPct.textContent = step.cpu + '%';
+      fsEl.style.width = step.fs + '%'; fsPct.textContent = step.fs + '%';
+      stepLabel.textContent = step.label;
+      totalBlocks.textContent = step.total;
+
+      if (step.cpu > 0 && step.fs === 0) {
+        spawnParticle(
+          getCenter(podEl).x - 40, getCenter(podEl).y - 10,
+          getCenter(podEl).x - 40, getCenter(podEl).y + 10,
+          '#4488ff', 10, 800
+        );
+      }
+
+      if (step.fs > 0) {
+        storageEl.classList.add('highlight');
+        const numVisible = Math.floor(step.fs / 2);
+        for (let i = 0; i < numVisible && i < 30; i++) {
+          const sb = document.getElementById(`sb-${i}`);
+          if (sb) sb.classList.add('visible');
+        }
+
+        spawnParticle(
+          getCenter(podEl).x, getCenter(podEl).y + 30,
+          getCenter(storageEl).x, getCenter(storageEl).y - 20,
+          '#cc44ff', 10, 1000
+        );
+      }
+    }, step.delay);
+  });
+
+  scheduleInScene(() => callout.classList.add('visible'), 9000);
+}
+
+// ── SCENE 6: BENCHMARKS ──
+function animateBenchmarks() {
+  const fills = document.querySelectorAll('.bench-fill');
+  fills.forEach(f => f.style.width = '0%');
+
+  ['bench-stat1', 'bench-stat2', 'bench-stat3', 'bench-stat4'].forEach(id => {
+    document.getElementById(id).style.opacity = '0';
+  });
+
+  document.getElementById('b50-ttft-change').textContent = '';
+  document.getElementById('b50-ttft-pct').textContent = '';
+  document.getElementById('b50-tp-change').textContent = '';
+  document.getElementById('b50-tp-pct').textContent = '';
+  document.getElementById('b70-ttft-change').textContent = '';
+  document.getElementById('b70-ttft-pct').textContent = '';
+  document.getElementById('b70-tp-change').textContent = '';
+  document.getElementById('b70-tp-pct').textContent = '';
+
+  scheduleInScene(() => {
+    fills.forEach(f => {
+      const target = f.dataset.target;
+      if (target) f.style.width = target + '%';
+    });
+  }, 400);
+
+  scheduleInScene(() => {
+    document.getElementById('b50-ttft-pct').textContent = '↓ 20.7%';
+    document.getElementById('b50-tp-pct').textContent = '↑ 22.7%';
+    document.getElementById('b70-ttft-pct').textContent = '↓ 22.4%';
+    document.getElementById('b70-tp-pct').textContent = '↑ 28.7%';
+  }, 1600);
+
+  scheduleInScene(() => {
+    ['bench-stat1', 'bench-stat2', 'bench-stat3', 'bench-stat4'].forEach(id => {
+      document.getElementById(id).style.opacity = '1';
+    });
+  }, 2000);
+}
+
+// ── SCENE 7: SUMMARY ──
+function animateSummary() {
+  for (let i = 0; i < 6; i++) {
+    const card = document.getElementById(`sum${i}`);
+    card.classList.remove('visible');
+    scheduleInScene(() => card.classList.add('visible'), 300 + i * 300);
+  }
+}
+
+// ── SCENE 8: RESOURCES ──
+function animateResources() {
+  for (let i = 0; i < 6; i++) {
+    const card = document.getElementById(`res${i}`);
+    card.classList.remove('visible');
+    scheduleInScene(() => card.classList.add('visible'), 200 + i * 200);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  KEYBOARD + INIT
+// ══════════════════════════════════════════════════════════════
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); nextScene(); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); prevScene(); }
+  if (e.key === 'a') toggleAuto();
+});
+
+initDots();
+</script>
+</body>
+</html>
